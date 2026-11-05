@@ -12,6 +12,9 @@ async function equal(a:string,b:string){return await digest(a)===await digest(b)
 async function signature(s:string,secret:string){const key=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);return [...new Uint8Array(await crypto.subtle.sign('HMAC',key,enc.encode(s)))].map(x=>x.toString(16).padStart(2,'0')).join('')}
 async function admin(req:Request,env:Env){if(!env.SESSION_SECRET)return false;const c=req.headers.get('cookie')?.match(/(?:^|; )ing_host=([^;]+)/)?.[1];if(!c)return false;const [exp,sig]=c.split('.');return Number(exp)>Date.now()&&await equal(sig||'',await signature(exp,env.SESSION_SECRET))}
 const clean=(x:unknown,n=200)=>typeof x==='string'?x.trim().slice(0,n):'';
+const crewLabels:Record<string,string>={photo_booth:'Photo Booth Crew',food_drink:'Food & Drink Crew',cleanup:'Cleanup Crew',welcome_ticket:'Welcome & Ticket Crew'};
+function crewData(value:unknown){try{const data=JSON.parse(String(value||'{}'));return {volunteerRoles:Array.isArray(data.roles)?data.roles.filter((id:unknown)=>typeof id==='string'&&Object.hasOwn(crewLabels,id)):[],volunteerNote:clean(data.note,1000)}}catch{return {volunteerRoles:[],volunteerNote:''}}}
+const inviteCrewSQL="SELECT i.*,s.value AS volunteer_data FROM invites i LEFT JOIN settings s ON s.key=('volunteer:' || i.id) ORDER BY i.name";
 async function rate(req:Request,env:Env,kind:string,n:number){const key=kind+':'+new Date().toISOString().slice(0,10)+':'+await digest((req.headers.get('CF-Connecting-IP')||'local')+(env.SESSION_SECRET||''));const row=await env.DB.prepare('INSERT INTO limits(key,count) VALUES(?,1) ON CONFLICT(key) DO UPDATE SET count=limits.count+1 RETURNING count').bind(key).first<{count:number}>();return (row?.count||0)<=n}
 async function invite(req:Request,env:Env){const token=req.headers.get('X-Invite')||new URL(req.url).searchParams.get('invite')||'';return token.length===36?await env.DB.prepare('SELECT * FROM invites WHERE id=?').bind(token).first<any>():null}
 async function photoAccess(req:Request,env:Env){return !!await invite(req,env)||!!(env.PHOTO_CODE&&await equal(req.headers.get('X-Photo-Code')||'',env.PHOTO_CODE))}
@@ -44,14 +47,17 @@ export async function api(req:Request,env:Env):Promise<Response>{
  const b=await req.json() as any;if(!await equal(clean(b.password,200),env.ADMIN_PASSWORD))return fail('That password is not correct.',401);
  const exp=String(Date.now()+8*3600_000);return new Response(JSON.stringify({ok:true}),{headers:{'Content-Type':'application/json','Set-Cookie':`ing_host=${exp}.${await signature(exp,env.SESSION_SECRET)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=28800`,'Cache-Control':'no-store'}});
  }
- if(p==='/api/invite'&&m==='GET'){const row=await invite(req,env);return row?json({name:row.name,maxGuests:row.max_guests,status:row.status,guests:row.guests,guestNames:row.guest_names,note:row.note}):fail('This invitation link was not found. Please contact your host.',404)}
+ if(p==='/api/invite'&&m==='GET'){const row=await invite(req,env);const crew=row?await env.DB.prepare('SELECT value FROM settings WHERE key=?').bind('volunteer:'+row.id).first<any>():null;return row?json({...crewData(crew?.value),name:row.name,maxGuests:row.max_guests,status:row.status,guests:row.guests,guestNames:row.guest_names,note:row.note}):fail('This invitation link was not found. Please contact your host.',404)}
  if(p==='/api/rsvp'&&m==='POST'){
  const row=await invite(req,env);if(!row)return fail('Please open your personal invitation link to RSVP.',403);
  if(Date.now()>=Date.parse('2026-12-06T08:00:00Z'))return fail('The RSVP deadline has passed. Please contact your host.');
  if(!await rate(req,env,'rsvp',60))return fail('Please try again tomorrow.',429);
  const b=await req.json() as any;if(!['going','declined'].includes(b.status))return fail('Choose an attendance response.');
  const guests=b.status==='going'?Number(b.guests):0;if(!Number.isInteger(guests)||guests<0||guests>row.max_guests||(b.status==='going'&&guests<1))return fail('Please check the number of guests.');
- await env.DB.prepare('UPDATE invites SET status=?,guests=?,guest_names=?,note=?,updated=? WHERE id=?').bind(b.status,guests,clean(b.guestNames,1000),clean(b.note,1000),new Date().toISOString(),row.id).run();return json({ok:true});
+ if(b.volunteerRoles!==undefined&&(!Array.isArray(b.volunteerRoles)||b.volunteerRoles.length>4||b.volunteerRoles.some((id:unknown)=>typeof id!=='string'||!Object.hasOwn(crewLabels,id))))return fail('Please choose a listed volunteer role.');
+ const previous=await env.DB.prepare('SELECT value FROM settings WHERE key=?').bind('volunteer:'+row.id).first<any>();const saved=crewData(previous?.value);
+ const roles=b.status==='going'?[...new Set(b.volunteerRoles??saved.volunteerRoles)]:[];const note=b.status==='going'?(b.volunteerNote===undefined?saved.volunteerNote:clean(b.volunteerNote,1000)):'';
+ await env.DB.batch([env.DB.prepare('UPDATE invites SET status=?,guests=?,guest_names=?,note=?,updated=? WHERE id=?').bind(b.status,guests,clean(b.guestNames,1000),clean(b.note,1000),new Date().toISOString(),row.id),env.DB.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind('volunteer:'+row.id,JSON.stringify({roles,note}))]);return json({ok:true});
  }
  if(p==='/api/photos'&&m==='GET'){const all=await admin(req,env);const rows=await env.DB.prepare(all?'SELECT * FROM photos ORDER BY created DESC LIMIT 500':'SELECT id,name,caption,created FROM photos WHERE state=\'approved\' ORDER BY created DESC LIMIT 200').all();return json(rows.results)}
  if(p.startsWith('/api/photo/')&&m==='GET'){
@@ -75,13 +81,13 @@ export async function api(req:Request,env:Env):Promise<Response>{
  if(p.startsWith('/api/admin/')){
  if(!await admin(req,env))return fail('Please sign in as the host.',401);
  if(p==='/api/admin/dashboard'){
- const invites=await env.DB.prepare('SELECT * FROM invites ORDER BY name').all();const bytes=await env.DB.prepare('SELECT count FROM limits WHERE key=\'storage\'').first<any>();const photos=await env.DB.prepare('SELECT COUNT(*) as count FROM photos').first<any>();return json({invites:invites.results,bytes:bytes?.count||0,photoCount:photos?.count||0,cap:CAP,photoCode:env.PHOTO_CODE||''});
+ const invites=await env.DB.prepare(inviteCrewSQL).all();const bytes=await env.DB.prepare('SELECT count FROM limits WHERE key=\'storage\'').first<any>();const photos=await env.DB.prepare('SELECT COUNT(*) as count FROM photos').first<any>();return json({invites:invites.results.map((row:any)=>{const {volunteer_data,...invite}=row;return {...invite,...crewData(volunteer_data)}}),bytes:bytes?.count||0,photoCount:photos?.count||0,cap:CAP,photoCode:env.PHOTO_CODE||''});
  }
  if(p==='/api/admin/invites'&&m==='POST'){
  const b=await req.json() as any,name=clean(b.name,120),max=Number(b.maxGuests);if(!name||!Number.isInteger(max)||max<1||max>20)return fail('Enter a name and a party size between 1 and 20.');const id=crypto.randomUUID();await env.DB.prepare('INSERT INTO invites(id,name,email,max_guests,updated) VALUES(?,?,?,?,?)').bind(id,name,clean(b.email,200),max,new Date().toISOString()).run();return json({id});
  }
  if(p==='/api/admin/export'){
- const rows=(await env.DB.prepare('SELECT name,email,status,guests,guest_names,note FROM invites ORDER BY name').all<any>()).results;const keys=['name','email','status','guests','guest_names','note'];return new Response([keys.join(','),...rows.map(r=>keys.map(k=>csvCell(r[k])).join(','))].join('\r\n'),{headers:{'Content-Type':'text/csv','Content-Disposition':'attachment; filename="ING-Winter-Fest-RSVPs.csv"','Cache-Control':'no-store'}});
+ const rows=(await env.DB.prepare(inviteCrewSQL).all<any>()).results;for(const row of rows){const crew=crewData(row.volunteer_data);row.volunteer_roles=crew.volunteerRoles.map((id:string)=>crewLabels[id]).join('; ');row.volunteer_note=crew.volunteerNote}const keys=['name','email','status','guests','guest_names','note','volunteer_roles','volunteer_note'];return new Response([keys.join(','),...rows.map(r=>keys.map(k=>csvCell(r[k])).join(','))].join('\r\n'),{headers:{'Content-Type':'text/csv','Content-Disposition':'attachment; filename="ING-Winter-Fest-RSVPs.csv"','Cache-Control':'no-store'}});
  }
  if(p.startsWith('/api/admin/photos/')&&(m==='PATCH'||m==='DELETE')){
  const id=p.split('/').pop()||'',row=await env.DB.prepare('SELECT * FROM photos WHERE id=?').bind(id).first<any>();if(!row)return fail('Photo not found.',404);
