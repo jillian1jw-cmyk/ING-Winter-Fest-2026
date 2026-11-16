@@ -50,7 +50,7 @@ export async function api(req:Request,env:Env):Promise<Response>{
  const u=new URL(req.url),p=u.pathname,m=req.method;
  try{
  if(!['GET','HEAD'].includes(m)&&req.headers.get('Origin')!==u.origin)return fail('Please use this website to submit your request.',403);
- const slots=['logo','banner','portrait','invitation','band_mojave','band_signs'];
+ const slots=['logo','banner','portrait','invitation','band_mojave','band_signs','band_fds'];
  if(p.startsWith('/api/assets/')&&['GET','HEAD'].includes(m)){
  const slot=p.split('/').pop()||'';if(!slots.includes(slot))return fail('Image slot not found.',404);
  const obj=await env.BUCKET.get('website/'+slot);if(!obj)return fail('No image uploaded yet.',404);
