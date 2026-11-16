@@ -85,7 +85,7 @@ export async function api(req:Request,env:Env):Promise<Response>{
  if(b.volunteerRoles!==undefined&&(!Array.isArray(b.volunteerRoles)||b.volunteerRoles.length>4||b.volunteerRoles.some((id:unknown)=>typeof id!=='string'||!Object.hasOwn(crewLabels,id))))return fail('Please choose a listed volunteer role.');
  await initFood(env.DB);
  return await env.DB.transaction(async db=>{
- const food=await readFood(db,true);const oldClaim=food.claims[row.id];
+ const food=await readFood(db,true);const activeInvite=await db.prepare('SELECT id,max_guests FROM invites WHERE id=?').bind(row.id).first<any>();if(!activeInvite)return fail('This invitation is no longer active.',403);if(guests>activeInvite.max_guests)return fail('Your invitation allowance changed. Refresh the page and check the guest count.',409);const oldClaim=food.claims[row.id];
  const choices=b.status==='declined'?[]:(b.foodSelections===undefined?(oldClaim?.items||[]):b.foodSelections);
  if(!Array.isArray(choices)||choices.length>50||choices.some((choice:any)=>!choice||typeof choice.id!=='string'||!Number.isInteger(choice.quantity)||choice.quantity<1||choice.quantity>1000)||new Set(choices.map((x:any)=>x.id)).size!==choices.length)return fail('Please check your food contribution quantities.');
  const counts=foodSummary(food);
@@ -134,6 +134,20 @@ export async function api(req:Request,env:Env):Promise<Response>{
  }
  if(p==='/api/admin/dashboard'){
  const invites=await env.DB.prepare(inviteCrewSQL).all();const bytes=await env.DB.prepare('SELECT count FROM limits WHERE key=\'storage\'').first<any>();const photos=await env.DB.prepare('SELECT COUNT(*) as count FROM photos').first<any>();return json({invites:invites.results.map((row:any)=>{const {volunteer_data,...invite}=row;return {...invite,...crewData(volunteer_data)}}),bytes:bytes?.count||0,photoCount:photos?.count||0,cap:CAP,photoCode:env.PHOTO_CODE||''});
+ }
+ if(p.startsWith('/api/admin/invites/')&&m==='PATCH'){
+ const id=p.slice('/api/admin/invites/'.length);if(!/^[0-9a-fA-F-]{36}$/.test(id))return fail('Invitation not found.',404);
+ const b=await req.json() as any,name=clean(b.name,120),max=Number(b.maxGuests);if(!name||!Number.isInteger(max)||max<1||max>20)return fail('Enter a name and an invitation allowance between 1 and 20.');
+ await initFood(env.DB);return await env.DB.transaction(async db=>{await readFood(db,true);const row=await db.prepare('SELECT * FROM invites WHERE id=?').bind(id).first<any>();if(!row)return fail('Invitation not found.',404);if(row.status==='going'&&row.guests>max)return fail('This household has already RSVP’d for '+row.guests+' people. Update their RSVP through their invitation link before lowering the invitation allowance.',409);await db.prepare('UPDATE invites SET name=?,max_guests=?,updated=? WHERE id=?').bind(name,max,new Date().toISOString(),id).run();return json({ok:true})});
+ }
+ if(p.startsWith('/api/admin/invites/')&&m==='DELETE'){
+ const id=p.slice('/api/admin/invites/'.length);if(!/^[0-9a-fA-F-]{36}$/.test(id))return fail('Invitation not found.',404);
+ await initFood(env.DB);return await env.DB.transaction(async db=>{
+ const food=await readFood(db,true);const row=await db.prepare('SELECT id FROM invites WHERE id=?').bind(id).first();if(!row)return fail('Invitation not found.',404);
+ delete food.claims[id];await writeFood(db,food);
+ await db.prepare('DELETE FROM settings WHERE key=?').bind('volunteer:'+id).run();
+ await db.prepare('DELETE FROM invites WHERE id=?').bind(id).run();return json({ok:true});
+ });
  }
  if(p==='/api/admin/invites'&&m==='POST'){
  const b=await req.json() as any,name=clean(b.name,120),max=Number(b.maxGuests);if(!name||!Number.isInteger(max)||max<1||max>20)return fail('Enter a name and a party size between 1 and 20.');const id=crypto.randomUUID();await env.DB.prepare('INSERT INTO invites(id,name,email,max_guests,updated) VALUES(?,?,?,?,?)').bind(id,name,clean(b.email,200),max,new Date().toISOString()).run();return json({id});
