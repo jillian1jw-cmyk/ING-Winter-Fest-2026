@@ -14,3 +14,6 @@ for = "/*"
 [headers.values]
 X-Content-Type-Options = "nosniff"
 Referrer-Policy = "no-referrer"
+
+Content-Security-Policy = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self'; font-src 'self'; media-src 'self' blob:"
+Permissions-Policy = "camera=(), microphone=(), geolocation=(), payment=()"
